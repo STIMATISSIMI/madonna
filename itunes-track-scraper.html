@@ -8,26 +8,47 @@
   body{font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial; padding:20px; max-width:900px}
   input[type=text]{width:100%; padding:8px; margin:6px 0}
   button{padding:8px 12px; margin-right:8px}
-  textarea{width:100%; height:300px; padding:8px; margin-top:10px; font-family:monospace}
+  textarea{width:100%; height:220px; padding:8px; margin-top:10px; font-family:monospace}
   .status{margin-top:10px; color:#444}
   .small{font-size:0.9em; color:#666}
+  .row{display:flex;gap:8px;align-items:center;margin-top:8px}
+  .col{flex:1}
 </style>
 </head>
 <body>
   <h1>Apple Music: estrai tracklist e copia come testo</h1>
-  <p>Incolla l'URL dell'album Apple Music (es. https://music.apple.com/...)</p>
+  <p>Due modalità:
+    <ul>
+      <li>Fetch da URL (potrebbe essere bloccato da CORS)</li>
+      <li>Incollare qui il risultato di "copy &gt; inner HTML" dall'ispeziona elemento: questa modalità funziona sempre perché parsiamo l'HTML che incolli</li>
+    </ul>
+  </p>
 
+  <h2>1) Usa URL (fetch)</h2>
   <input id="url" type="text" placeholder="https://music.apple.com/..." />
-  <div>
-    <button id="fetchBtn">Prendi tracklist</button>
-    <button id="proxyBtn">Usa proxy CORS pubblico</button>
-    <button id="clearBtn">Pulisci</button>
-    <button id="copyBtn">Copia negli appunti</button>
+  <div class="row">
+    <div class="col">
+      <button id="fetchBtn">Prendi tracklist</button>
+      <button id="proxyBtn">Usa proxy CORS pubblico</button>
+      <button id="clearBtn">Pulisci</button>
+      <button id="copyBtn">Copia negli appunti</button>
+      <button id="downloadBtn">Scarica .txt</button>
+    </div>
+  </div>
+
+  <h2>2) Incolla inner HTML (consigliato se fai copy inner HTML)</h2>
+  <div class="small">Se con Ispeziona Element selezioni la parte della tabella che contiene la tracklist e fai "Copy &gt; Copy innerHTML", incolla qui sotto e premi "Estrai da HTML incollato".</div>
+  <textarea id="paste" placeholder="Incolla qui l'innerHTML copiato dall'ispeziona elemento..."></textarea>
+  <div class="row">
+    <div class="col">
+      <button id="parsePasteBtn">Estrai da HTML incollato</button>
+      <button id="clearPasteBtn">Pulisci HTML incollato</button>
+    </div>
   </div>
 
   <div class="status" id="status">Pronto.</div>
-  <div class="small">Se il sito blocca CORS, premi "Usa proxy CORS pubblico" (richiede connessione a servizi terzi). Se vuoi eseguire localmente senza proxy, apri il file tramite un piccolo server (es. Live Server, python -m http.server) o usa GitHub Pages.</div>
 
+  <h2>Result</h2>
   <textarea id="out" placeholder="I titoli estratti compariranno qui..." readonly></textarea>
 
 <script>
@@ -35,20 +56,156 @@ const fetchBtn = document.getElementById('fetchBtn');
 const proxyBtn = document.getElementById('proxyBtn');
 const copyBtn = document.getElementById('copyBtn');
 const clearBtn = document.getElementById('clearBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const parsePasteBtn = document.getElementById('parsePasteBtn');
+const clearPasteBtn = document.getElementById('clearPasteBtn');
+
 const out = document.getElementById('out');
 const status = document.getElementById('status');
 const urlInput = document.getElementById('url');
+const pasteArea = document.getElementById('paste');
 
 async function fetchPage(url, useProxy=false){
   let fetchUrl = url;
   if(useProxy){
-    fetchUrl = 'https://r.jina.ai/http://' + url.replace(/^https?:\/\/,'');
+    fetchUrl = 'https://r.jina.ai/http://' + url.replace(/^https?:\/\//,'');
   }
   const res = await fetch(fetchUrl);
   if(!res.ok) throw new Error('Fetch fallito: ' + res.status + ' ' + res.statusText);
   return await res.text();
 }
 
+function extractTextsFromNode(node){
+  const texts = [];
+  const walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode: function(n){
+      if(n.nodeType === Node.TEXT_NODE){
+        const t = n.textContent.trim();
+        if(!t) return NodeFilter.FILTER_REJECT;
+        if(/^[\d\.\-\s:()]+$/.test(t)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+      if(n.nodeType === Node.ELEMENT_NODE){
+        const tag = n.tagName.toLowerCase();
+        if(['script','style','img','svg','button','input'].includes(tag)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_SKIP;
+      }
+      return NodeFilter.FILTER_SKIP;
+    }
+  }, false);
+  let cur;
+  while(cur = walker.nextNode()){
+    if(cur.nodeType === Node.TEXT_NODE){
+      let t = cur.textContent.replace(/\u00A0/g,' ').trim();
+      if(t) texts.push(t);
+    }
+  }
+  return texts;
+}
+
+function cleanAndFilter(lines){
+  return lines
+    .map(s => s.replace(/\s+/g,' ').trim())
+    .map(s => s.replace(/^\d+[\)\.\-\s]+/,'').trim())
+    .map(s => s.replace(/\s*[-—–]\s*\d{1,2}:\d{2}(\.\d+)?$/,'').trim())
+    .filter(s => s && s.length < 200)
+    .map(s => {
+      const sep = / - | — | – | \| /;
+      if(sep.test(s)){
+        const parts = s.split(sep);
+        if(parts.length >= 2){
+          const last = parts[parts.length-1].trim();
+          const first = parts[0].trim();
+          if(last.length > 2 && first.length < last.length) return last;
+        }
+      }
+      return s;
+    })
+    .filter(Boolean);
+}
+
+function parseFromDOMString(html){
+  const normalized = html.replace(/<br\s*\/?>/gi, '\n');
+  const doc = new DOMParser().parseFromString(normalized, 'text/html');
+
+  const selectors = [
+    '.songs-list-row__song-name',
+    '.songs-list-row .songs-list-row__song-name',
+    '[data-test-song-name]',
+    '.song-name',
+    '.trackName',
+    'td',
+    'tr',
+    'li'
+  ];
+  let collected = [];
+
+  for(const sel of selectors){
+    const nodes = doc.querySelectorAll(sel);
+    if(nodes && nodes.length){
+      nodes.forEach(n=>{
+        const txt = n.textContent.trim();
+        if(txt) collected.push(txt);
+      });
+      if(collected.length >= 2) break;
+    }
+  }
+
+  if(collected.length === 0){
+    collected = extractTextsFromNode(doc.body);
+  }
+
+  let splitList = [];
+  collected.forEach(s=>{
+    s.split(/\r?\n/).forEach(part=>{
+      const pp = part.trim();
+      if(pp) splitList.push(pp);
+    });
+  });
+
+  const cleaned = cleanAndFilter(splitList);
+  const seen = new Set();
+  const unique = [];
+  for(const t of cleaned){
+    if(!seen.has(t)){
+      seen.add(t);
+      unique.push(t);
+    }
+  }
+  return unique;
+}
+
+function formatOutput(list){
+  if(list.length === 0) return '';
+  return list.join('\n');
+}
+
+async function extract(url, useProxy=false){
+  status.textContent = 'Scaricamento...';
+  out.value = '';
+  try{
+    const html = await fetchPage(url, useProxy);
+    status.textContent = 'Parsing DOM...';
+    let tracks = tryDOMParsing(html);
+    if(tracks.length === 0){
+      status.textContent = 'Parsing JSON/regex...';
+      tracks = tryRegexJSON(html);
+    }
+    tracks = tracks.map(t=>t.replace(/^\d+\s*/,'').trim()).filter(Boolean);
+    tracks = tracks.filter(t=>t.length < 200);
+    tracks = Array.from(new Set(tracks));
+    if(tracks.length === 0){
+      status.textContent = 'Nessun titolo trovato. Potrebbe essere un problema di CORS o la pagina genera la lista via JavaScript lato client.';
+      return [];
+    }
+    status.textContent = `Trovati ${tracks.length} tracce.`;
+    return tracks;
+  }catch(err){
+    throw err;
+  }
+}
+
+/* reuse parsing helpers for fetch */
 function tryDOMParsing(html){
   try{
     const parser = new DOMParser();
@@ -56,7 +213,7 @@ function tryDOMParsing(html){
     const selectors = [
       '.songs-list-row__song-name',
       '.songs-list-row .songs-list-row__song-name',
-      '[class*=\"song-name\"]',
+      '[class*="song-name"]',
       '.track-name',
       '[data-test-song-name]',
       '.song-name'
@@ -87,10 +244,10 @@ function tryDOMParsing(html){
 
 function tryRegexJSON(html){
   const patterns = [
-    /"trackName"\s*:\s*"([^\"]+)"/g,
-    /"name"\s*:\s*"([^\"]+)"\s*,\s*"artistName"/g,
-    /"title"\s*:\s*"([^\"]+)"/g,
-    /"attributes":\s*{\s*"name"\s*:\s*"([^\"]+)"/g
+    /"trackName"\s*:\s*"([^"]+)"/g,
+    /"name"\s*:\s*"([^"]+)"\s*,\s*"artistName"/g,
+    /"title"\s*:\s*"([^"]+)"/g,
+    /"attributes":\s*{\s*"name"\s*:\s*"([^"]+)"/g
   ];
   const found = [];
   for(const pat of patterns){
@@ -98,7 +255,7 @@ function tryRegexJSON(html){
     while((m = pat.exec(html)) !== null){
       if(m[1]) {
         try{
-          const un = JSON.parse('"' + m[1].replace(/\\/g,'\\\\').replace(/"/g,'\"') + '"');
+          const un = JSON.parse('"' + m[1].replace(/\\/g,'\\\\').replace(/"/g,'\\"') + '"');
           found.push(un);
         }catch(err){
           found.push(m[1]);
@@ -116,36 +273,7 @@ function tryRegexJSON(html){
   return list;
 }
 
-function formatOutput(list){
-  if(list.length === 0) return '';
-  return list.join('\n');
-}
-
-async function extract(url, useProxy=false){
-  status.textContent = 'Scaricamento...';
-  out.value = '';
-  try{
-    const html = await fetchPage(url, useProxy);
-    status.textContent = 'Parsing DOM...';
-    let tracks = tryDOMParsing(html);
-    if(tracks.length === 0){
-      status.textContent = 'Parsing JSON/regex...';
-      tracks = tryRegexJSON(html);
-    }
-    tracks = tracks.map(t=>t.replace(/^\d+\.\s*/,'').trim()).filter(Boolean);
-    tracks = tracks.filter(t=>t.length < 200);
-    tracks = Array.from(new Set(tracks));
-    if(tracks.length === 0){
-      status.textContent = 'Nessun titolo trovato. Potrebbe essere un problema di CORS o la pagina genera la lista via JavaScript lato client.';
-      return [];
-    }
-    status.textContent = `Trovati ${tracks.length} tracce.`;
-    return tracks;
-  }catch(err){
-    throw err;
-  }
-}
-
+/* Event handlers */
 fetchBtn.addEventListener('click', async ()=>{
   const url = urlInput.value.trim();
   if(!url){ status.textContent = 'Inserisci un URL valido.'; return; }
@@ -178,10 +306,44 @@ copyBtn.addEventListener('click', async ()=>{
   }
 });
 
+downloadBtn.addEventListener('click', ()=>{
+  if(!out.value){ status.textContent = 'Nessun contenuto da scaricare.'; return; }
+  const blob = new Blob([out.value], {type: 'text/plain;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'tracklist.txt';
+  a.click();
+  URL.revokeObjectURL(url);
+  status.textContent = 'Download avviato.';
+});
+
 clearBtn.addEventListener('click', ()=>{
   urlInput.value = '';
   out.value = '';
   status.textContent = 'Pulito.';
+});
+
+parsePasteBtn.addEventListener('click', ()=>{
+  const raw = pasteArea.value.trim();
+  if(!raw){ status.textContent = "Incolla prima l'innerHTML."; return; }
+  try{
+    const list = parseFromDOMString(raw);
+    if(list.length === 0){
+      status.textContent = "Non ho trovato titoli nell'HTML incollato. Prova a incollare una selezione più ampia della tabella.";
+      out.value = '';
+      return;
+    }
+    out.value = formatOutput(list);
+    status.textContent = `Estratte ${list.length} tracce dall'HTML incollato.`;
+  }catch(err){
+    status.textContent = 'Errore parsing HTML incollato: ' + err.message;
+  }
+});
+
+clearPasteBtn.addEventListener('click', ()=>{
+  pasteArea.value = '';
+  status.textContent = 'HTML incollato pulito.';
 });
 </script>
 </body>
