@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Apple Music Tracklist → Testo</title>
+<style>
+  body{font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial; padding:20px; max-width:900px}
+  input[type=text]{width:100%; padding:8px; margin:6px 0}
+  button{padding:8px 12px; margin-right:8px}
+  textarea{width:100%; height:300px; padding:8px; margin-top:10px; font-family:monospace}
+  .status{margin-top:10px; color:#444}
+  .small{font-size:0.9em; color:#666}
+</style>
+</head>
+<body>
+  <h1>Apple Music: estrai tracklist e copia come testo</h1>
+  <p>Incolla l'URL dell'album Apple Music (es. https://music.apple.com/...)</p>
+
+  <input id="url" type="text" placeholder="https://music.apple.com/..." />
+  <div>
+    <button id="fetchBtn">Prendi tracklist</button>
+    <button id="proxyBtn">Usa proxy CORS pubblico</button>
+    <button id="clearBtn">Pulisci</button>
+    <button id="copyBtn">Copia negli appunti</button>
+  </div>
+
+  <div class="status" id="status">Pronto.</div>
+  <div class="small">Se il sito blocca CORS, premi "Usa proxy CORS pubblico" (richiede connessione a servizi terzi). Se vuoi eseguire localmente senza proxy, apri il file tramite un piccolo server (es. Live Server, python -m http.server) o usa GitHub Pages.</div>
+
+  <textarea id="out" placeholder="I titoli estratti compariranno qui..." readonly></textarea>
+
+<script>
+const fetchBtn = document.getElementById('fetchBtn');
+const proxyBtn = document.getElementById('proxyBtn');
+const copyBtn = document.getElementById('copyBtn');
+const clearBtn = document.getElementById('clearBtn');
+const out = document.getElementById('out');
+const status = document.getElementById('status');
+const urlInput = document.getElementById('url');
+
+async function fetchPage(url, useProxy=false){
+  let fetchUrl = url;
+  if(useProxy){
+    fetchUrl = 'https://r.jina.ai/http://' + url.replace(/^https?:\/\/,'');
+  }
+  const res = await fetch(fetchUrl);
+  if(!res.ok) throw new Error('Fetch fallito: ' + res.status + ' ' + res.statusText);
+  return await res.text();
+}
+
+function tryDOMParsing(html){
+  try{
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    const selectors = [
+      '.songs-list-row__song-name',
+      '.songs-list-row .songs-list-row__song-name',
+      '[class*=\"song-name\"]',
+      '.track-name',
+      '[data-test-song-name]',
+      '.song-name'
+    ];
+    let texts = [];
+    for(const sel of selectors){
+      const nodes = doc.querySelectorAll(sel);
+      if(nodes && nodes.length){
+        nodes.forEach(n=>{
+          const t = n.textContent.trim();
+          if(t) texts.push(t);
+        });
+      }
+    }
+    if(texts.length === 0){
+      const rows = doc.querySelectorAll('li[role="row"], tr');
+      rows.forEach(r=>{
+        const t = (r.textContent || '').trim();
+        if(t && t.length < 200) texts.push(t);
+      });
+    }
+    texts = texts.map(s=>s.replace(/\s+/g,' ').trim()).filter(Boolean);
+    return Array.from(new Set(texts));
+  }catch(e){
+    return [];
+  }
+}
+
+function tryRegexJSON(html){
+  const patterns = [
+    /"trackName"\s*:\s*"([^\"]+)"/g,
+    /"name"\s*:\s*"([^\"]+)"\s*,\s*"artistName"/g,
+    /"title"\s*:\s*"([^\"]+)"/g,
+    /"attributes":\s*{\s*"name"\s*:\s*"([^\"]+)"/g
+  ];
+  const found = [];
+  for(const pat of patterns){
+    let m;
+    while((m = pat.exec(html)) !== null){
+      if(m[1]) {
+        try{
+          const un = JSON.parse('"' + m[1].replace(/\\/g,'\\\\').replace(/"/g,'\"') + '"');
+          found.push(un);
+        }catch(err){
+          found.push(m[1]);
+        }
+      }
+    }
+  }
+  const htmlMatches = [];
+  const reHtml = /songs-list-row__song-name[^>]*>([^<]+)</g;
+  let hm;
+  while((hm = reHtml.exec(html)) !== null){
+    if(hm[1]) htmlMatches.push(hm[1].trim());
+  }
+  const list = Array.from(new Set(found.concat(htmlMatches))).map(s=>s.replace(/\s+/g,' ').trim()).filter(Boolean);
+  return list;
+}
+
+function formatOutput(list){
+  if(list.length === 0) return '';
+  return list.join('\n');
+}
+
+async function extract(url, useProxy=false){
+  status.textContent = 'Scaricamento...';
+  out.value = '';
+  try{
+    const html = await fetchPage(url, useProxy);
+    status.textContent = 'Parsing DOM...';
+    let tracks = tryDOMParsing(html);
+    if(tracks.length === 0){
+      status.textContent = 'Parsing JSON/regex...';
+      tracks = tryRegexJSON(html);
+    }
+    tracks = tracks.map(t=>t.replace(/^\d+\.\s*/,'').trim()).filter(Boolean);
+    tracks = tracks.filter(t=>t.length < 200);
+    tracks = Array.from(new Set(tracks));
+    if(tracks.length === 0){
+      status.textContent = 'Nessun titolo trovato. Potrebbe essere un problema di CORS o la pagina genera la lista via JavaScript lato client.';
+      return [];
+    }
+    status.textContent = `Trovati ${tracks.length} tracce.`;
+    return tracks;
+  }catch(err){
+    throw err;
+  }
+}
+
+fetchBtn.addEventListener('click', async ()=>{
+  const url = urlInput.value.trim();
+  if(!url){ status.textContent = 'Inserisci un URL valido.'; return; }
+  try{
+    const list = await extract(url, false);
+    out.value = formatOutput(list);
+  }catch(err){
+    status.textContent = 'Errore: ' + err.message + ' (se è un errore CORS, prova il proxy)';
+  }
+});
+
+proxyBtn.addEventListener('click', async ()=>{
+  const url = urlInput.value.trim();
+  if(!url){ status.textContent = 'Inserisci un URL valido.'; return; }
+  try{
+    const list = await extract(url, true);
+    out.value = formatOutput(list);
+  }catch(err){
+    status.textContent = 'Errore con proxy: ' + err.message;
+  }
+});
+
+copyBtn.addEventListener('click', async ()=>{
+  if(!out.value) { status.textContent = 'Nessun contenuto da copiare.'; return; }
+  try{
+    await navigator.clipboard.writeText(out.value);
+    status.textContent = 'Copiato negli appunti.';
+  }catch(err){
+    status.textContent = 'Copia fallita: ' + err.message;
+  }
+});
+
+clearBtn.addEventListener('click', ()=>{
+  urlInput.value = '';
+  out.value = '';
+  status.textContent = 'Pulito.';
+});
+</script>
+</body>
+</html>
